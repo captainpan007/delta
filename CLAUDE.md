@@ -1,135 +1,203 @@
-# CLAUDE.md — Delta v2
+# CLAUDE.md — Delta v1 实施指南
 
 ## 项目定义
 
-Delta是Pan的私人作战系统，一家由agent构成的公司。
-本质：自动把全球市场信号转化成Pan可以直接行动的决策。
-交付物：不是产品，不是信息，是客户状态的变化量（Δ）。
-唯一客户：Pan本人。
+Delta是Pan的私人市场机会发现引擎。
+自动扫描G2差评和Reddit抱怨，用六个标准评分，推送报告给Pan。
+唯一客户：Pan本人（管理背景，非技术）。
 
-## 核心原则
+## 当前状态
 
-- NEVER STOP：系统在Pan睡觉时持续运转
-- 不预设市场：跟着信号走，数据说了算
-- 不重复发明轮子：优先组合现有最优agent
-- 最小闭环优先：先跑通情报+分析，再扩展
+- 设计文档已批准：`~/.gstack/projects/delta/Administrator-master-design-20260404-183640.md`
+- CEO计划已批准：`~/.gstack/projects/delta/ceo-plans/2026-04-05-delta-v1-single-script.md`
+- CEO Review: CLEAN | Eng Review: CLEAN | 可以开始实施
 
-## 协议架构
+## v1 架构（已审批）
 
-MCP（垂直）：每个agent连接自己的工具和数据源
-A2A（水平）：agent之间互相通信和协作
-两者互补，构成Delta的神经系统
+**单服务架构：Flask + APScheduler 在一个进程里，部署到Railway。**
 
-## 六个筛选标准
+不要用：多Agent架构、PostgreSQL、Langfuse、Redis、MCP/A2A协议。这些是v2的事。
 
-1. 信号可信：伪造成本高（付费>招聘>搜索>差评）
-2. 需求真实：付费已存在 + 抱怨持续并存
-3. 市场够大：竞品融资+ARR+搜索量+招聘+替代方案
-4. 用户有钱有意愿：竞品定价+职业收入+抱怨类型
-5. 竞品有缺口：差评内容+更新频率（降权参考）
-6. 流程可闭环：起点终点清晰+结果可归因
+```
+[Railway Web Service] ──always-on──▶ [Flask App]
+    │                                     │
+    ├── APScheduler (每天06:00 UTC)       ├── GET /decide?id=X&d=do
+    │   └── run_pipeline()                │   └── 显示确认页面
+    │       ├── backup_sqlite()           ├── POST /decide
+    │       ├── fetch_g2()                │   └── 记录决策到SQLite
+    │       ├── fetch_reddit()            └── GET /health
+    │       ├── deduplicate()
+    │       ├── score_opportunities()  ◀── Claude Sonnet API
+    │       ├── calculate_trends()
+    │       ├── generate_briefs()      ◀── Claude Sonnet API (仅Top 5)
+    │       ├── send_email()           ◀── SMTP
+    │       └── record_health()
+    │
+    └── 启动时检查：今天是否已跑过？没有则立即补跑
+```
 
-## 七个部门及其现有最优Agent
+## 关键设计决策（不可更改）
 
-| 部门 | 现有最优 | 接入方式 |
-|---|---|---|
-| 情报 | Firecrawl | MCP原生支持Claude |
-| 分析 | Claude Sonnet | 内置 |
-| 验证 | 人工节点 | Pan拍板 |
-| 建造 | Claude Code | 内置 |
-| 销售 | Artisan/Clay | API适配层 |
-| 交付 | 产品本身 | 取决于产品 |
-| 学习 | autoresearch模式 | 自建 |
+1. **单文件 main.py** — 所有逻辑在一个文件里，v1不拆分模块
+2. **SQLite** — 存储在Railway persistent volume，不用PostgreSQL
+3. **无阈值** — 发送所有机会按分数排序，不设最低分数线
+4. **Top 5简报** — 只给前5名生成详细200字简报，其余只显示分数+一句话
+5. **邮件点击决策** — GET显示确认页，POST记录决策（防止邮件bot误触发）
+6. **提示词外置** — `prompts/scoring.txt` 和 `prompts/brief.txt`，不硬编码
+7. **评分标准外置** — `scoring_criteria.yaml` 定义六标准权重，Pan可编辑
+8. **启动时补跑** — Flask启动时检查今天是否已运行，没有则立即执行pipeline
+9. **每次运行前备份SQLite** — 复制到 `delta_backup.db`
 
-## 人的角色（董事会）
+## 六个评分标准
 
-只在三个节点出现：
-1. 押注：看报告，决定要不要做
-2. 审批验证：验证报告后决定进不进建造
-3. 处理异常：正常运转不需要在场
+| # | id | 名称 | 初始权重 | 评分 |
+|---|---|---|---|---|
+| 1 | signal_credibility | 信号可信 | 1.0 | 0-10 |
+| 2 | real_demand | 需求真实 | 1.0 | 0-10 |
+| 3 | market_size | 市场够大 | 1.0 | 0-10 |
+| 4 | willingness_to_pay | 用户有钱有意愿 | 1.0 | 0-10 |
+| 5 | competitor_gap | 竞品有缺口 | 1.0 | 0-10 |
+| 6 | closeable_flow | 流程可闭环 | 1.0 | 0-10 |
 
-## 报告格式
+总分 = [Σ(score_i × weight_i) / Σ(weight_i)] × 10，满分100。
 
-每次有高分候选时推送，结构：
-- 机会描述（是什么，谁有这个痛苦）
-- 六维评分卡（每项得分+原始证据）
-- 针对Pan的执行建议（第一步做什么，成功标准是什么）
-Pan回复"做"即启动下一步
+## 数据库Schema
 
-## 技术栈
+```sql
+CREATE TABLE raw_signals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL,          -- 'g2' | 'reddit'
+  category TEXT NOT NULL,
+  title TEXT,
+  content TEXT NOT NULL,
+  url TEXT UNIQUE,
+  author TEXT,
+  signal_date TEXT,
+  fetched_at TEXT DEFAULT (datetime('now'))
+);
 
-编排层：Claude SDK（主agent + 子agent）
-采集层：Firecrawl（主）+ Crawl4AI（备）
-协议层：MCP（工具接入）+ A2A（agent协作，v0.3注意版本稳定性）
-记忆层：PostgreSQL + Redis，后期加RAG
-观测层：Langfuse（Day 1接入）
-人格层：七个部门各自独立prompt
-部署层：Railway + Cloudflare
+CREATE TABLE scored_opportunities (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  opportunity_name TEXT NOT NULL,
+  signal_ids TEXT,               -- JSON array of signal IDs
+  score_total REAL,
+  score_breakdown TEXT,          -- JSON: {"signal_credibility": 7, ...}
+  evidence_summary TEXT,
+  report_text TEXT,
+  trend_data TEXT,               -- JSON: {"last_week": 3, "this_week": 12, "direction": "accelerating"}
+  pushed_at TEXT,
+  push_status TEXT DEFAULT 'pending',
+  scored_at TEXT DEFAULT (datetime('now'))
+);
 
-## 开发顺序
+CREATE TABLE pan_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  opportunity_id INTEGER REFERENCES scored_opportunities(id),
+  decision TEXT NOT NULL,        -- 'do' | 'skip'
+  notes TEXT,
+  decided_at TEXT DEFAULT (datetime('now'))
+);
 
-第一阶段（最小闭环，目标3-7天）：
-- Firecrawl接入G2差评 + Reddit抱怨
-- Claude分析部门用六标准打分
-- 生成报告推送Pan
-- Pan确认/否决，记录结果
+CREATE TABLE pipeline_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_date TEXT NOT NULL,
+  g2_status TEXT,                -- 'ok' | 'failed' | 'skipped'
+  reddit_status TEXT,
+  signals_found INTEGER DEFAULT 0,
+  opportunities_scored INTEGER DEFAULT 0,
+  emails_sent INTEGER DEFAULT 0,
+  started_at TEXT DEFAULT (datetime('now')),
+  completed_at TEXT
+);
+```
 
-第二阶段（验证闭环）：
-- 自动生成落地页或冷邮件
-- 收集真实回应信号
+## 文件结构
 
-第三阶段（建造接入）：
-- Claude Code自动执行开发
+```
+delta/
+├── CLAUDE.md                    # 本文件
+├── main.py                      # 所有逻辑：Flask + APScheduler + pipeline
+├── scoring_criteria.yaml        # 六个标准的权重配置
+├── sources.yaml                 # G2品类 + subreddit列表
+├── prompts/
+│   ├── scoring.txt              # Claude评分提示词
+│   └── brief.txt                # Claude简报生成提示词
+├── templates/
+│   ├── email_daily.html         # 每日邮件模板
+│   ├── email_weekly.html        # 周报模板
+│   └── decide_confirm.html      # 决策确认页面
+├── requirements.txt             # Python依赖
+├── Procfile                     # Railway启动命令
+├── .env.example                 # 环境变量模板
+└── tests/
+    ├── test_fetchers.py
+    ├── test_scoring.py
+    ├── test_trends.py
+    ├── test_email.py
+    ├── test_pipeline.py
+    └── test_flask.py
+```
 
-第四阶段（销售接入）：
-- Artisan/Clay API适配
+## 环境变量
 
-第五阶段（学习闭环）：
-- autoresearch模式迭代prompt和权重
+```
+FIRECRAWL_API_KEY=              # Firecrawl API密钥
+ANTHROPIC_API_KEY=              # Claude API密钥
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=                      # Gmail地址
+SMTP_PASSWORD=                  # Gmail应用专用密码
+NOTIFY_EMAIL=                   # Pan的接收邮箱
+DELTA_BASE_URL=                 # Railway部署URL（用于决策链接）
+SQLITE_PATH=/data/delta.db      # Railway persistent volume路径
+```
 
-## autoresearch在Delta中的位置
+## 错误处理规则
 
-学习部门的运作方式：
-可修改文件：七个部门prompt + 六标准权重配置
-可量化指标：押注成功率、验证回复率、销售转化率
-自动验证：历史结果做测试集，自动打分
-NEVER STOP：系统持续自我进化
+- Firecrawl失败 → 标记source_health='failed'，跳过，继续其他源
+- Claude API失败 → 等30秒重试1次，仍失败则跳过该批次
+- SMTP失败 → 记录到pipeline_runs，下次运行时检查并告警
+- SQLite错误 → try/except包裹，失败时尝试发告警邮件
+- 未响应报告 → 不阻塞，继续下一周期，不重复推送同一机会
 
-## 参考项目
+## PRE-BUILD BLOCKER（实施前必须解决）
 
-- GPT Researcher：情报层参考实现
-- karpathy/autoresearch：学习部门模式
-- agency-agents：prompt写法参考
-- a2aproject/A2A：agent协作协议
-- Firecrawl：采集层
-- Langfuse：观测层
+1. **Firecrawl测试G2** — 拿到API key后先测试能否抓G2差评页面。如果不行，v1只用Reddit
+2. **种子扫描范围** — Pan需要定义初始的G2品类和subreddit列表
+
+## 实施顺序
+
+1. 搭建项目骨架（requirements.txt, .env, main.py Flask骨架）
+2. 实现SQLite初始化 + 数据模型
+3. 实现fetch_reddit()（Reddit API更可靠，先做）
+4. 实现fetch_g2()（Firecrawl，可能失败）
+5. 实现score_opportunities()（Claude API + 外置prompt）
+6. 实现calculate_trends()
+7. 实现generate_briefs()（仅Top 5）
+8. 实现send_email()（每日排序 + 周日摘要）
+9. 实现Flask /decide端点（GET确认页 + POST记录）
+10. 实现APScheduler定时 + 启动补跑逻辑
+11. 实现SQLite备份
+12. 写测试
+13. 部署到Railway
 
 ## 开发规则
 
-1. /plan before execute
-2. 一个session一个任务
-3. Opus规划，Sonnet执行
-4. 每步commit + push
-5. 用/compact压缩历史
-6. Prompt以"Be concise, no acknowledgment"开头
-7. ⚠️ A2A目前v0.3，注意版本变更风险
+1. 用中文沟通
+2. 每步commit + push
+3. 先写能跑的代码，再优化
+4. 不要过度架构——这是v1，一个文件搞定
+5. 所有API key从环境变量读取，绝不硬编码
 
 ## Skill routing
 
 When the user's request matches an available skill, ALWAYS invoke it using the Skill
 tool as your FIRST action. Do NOT answer directly, do NOT use other tools first.
-The skill has specialized workflows that produce better results than ad-hoc answers.
 
 Key routing rules:
-- Product ideas, "is this worth building", brainstorming → invoke office-hours
-- Bugs, errors, "why is this broken", 500 errors → invoke investigate
+- Bugs, errors, "why is this broken" → invoke investigate
 - Ship, deploy, push, create PR → invoke ship
 - QA, test the site, find bugs → invoke qa
 - Code review, check my diff → invoke review
-- Update docs after shipping → invoke document-release
-- Weekly retro → invoke retro
-- Design system, brand → invoke design-consultation
-- Visual audit, design polish → invoke design-review
 - Architecture review → invoke plan-eng-review
-- Save progress, checkpoint, resume → invoke checkpoint
 - Code quality, health check → invoke health
